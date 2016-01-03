@@ -1,0 +1,155 @@
+#! /usr/bin/python2.7
+
+"""
+Find the best ukko servers
+"""
+import paramiko
+import socket
+import re
+from urllib2 import urlopen
+from operator import itemgetter
+
+def get_page(url="http://www.cs.helsinki.fi/ukko/hpc-report.txt"):
+    """
+    >>> page = get_page()   
+    """
+    return urlopen(url).read()
+    
+
+def get_load(string):
+    """
+    >>> get_load("ukko003.hpc.cs.helsinki.fi    03  yes  yes     2  0.01   rr 3.2.0-69-generic   6.3.0 Restart postponed. Reserved: Yina Ye, until end of 17 Oct 2014 ")
+    0.01
+    >>> get_load("ukko027.hpc.cs.helsinki.fi    11   no   no     0     -   ok 3.2.0-55-generic   --        ")
+    1.0
+    """
+    res = re.findall(r" (\d\.\d{2}) ", string)
+    return float(res[0]) if len(res) > 0 else 1.0
+
+def get_machine_number(string):
+    """
+    >>> get_machine_number("ukko003.hpc.cs.helsinki.fi    03  yes  yes     2  0.01   rr 3.2.0-69-generic   6.3.0 Restart postponed. Reserved: Yina Ye, until end of 17 Oct 2014 ")
+    3
+    """
+    return int(re.findall(r"\d+", get_name(string))[0])
+
+def get_name(string):
+    """
+    >>> get_name("ukko003.hpc.cs.helsinki.fi    03  yes  yes     2  0.01   rr 3.2.0-69-generic   6.3.0 Restart postponed. Reserved: Yina Ye, until end of 17 Oct 2014 ")
+    'ukko003'
+    """
+    return re.findall(r"^(ukko\d{3})", string)[0]
+
+def reserved(string):
+    """
+    >>> reserved("ukko003.hpc.cs.helsinki.fi    03  yes  yes     2  0.01   rr 3.2.0-69-generic   6.3.0 Restart postponed. Reserved: Yina Ye, until end of 17 Oct 2014 ")
+    True
+    >>> reserved("ukko017.hpc.cs.helsinki.fi    01  yes  yes    14  1.03   cs 3.2.0-43-generic   6.3.0(no vt) Needs restart. ")
+    False
+    """
+    return True if re.findall(r"Reserved", string) else False
+    
+def valid_server_string(string):
+    """
+    >>> valid_server_string("ukko186(0.00) ukko095(0.01) ukko181(0.21) ukko094(0.97) ukko056(0.99) ukko157(1.01) ukko100(1.02) ukko065(1.03)")
+    False
+    >>> valid_server_string("ukko003.hpc.cs.helsinki.fi    03  yes  yes     2  0.01   rr 3.2.0-69-generic   6.3.0 Restart postponed. Reserved: Yina Ye, until end of 17 Oct 2014 ")
+    True
+    """
+    return not (re.match(r"^ukko\d{3}.* \d\.\d{2} ", string) == None)
+
+def best_n(n = 13, filter_reserved = True, exclude_number_range = None, exclude_numbers = None):
+    """
+    Return top n (server, load) tuple
+    
+    >>> servers = best_n(13, exclude_number_range = (97, 192))
+
+    """
+    if exclude_numbers is None:
+        exclude_numbers = []
+
+    page_lines = get_page().split("\n")
+
+    
+    if exclude_number_range:
+        assert len(exclude_number_range) == 2
+        start, end = exclude_number_range
+    else:
+        server_numbers = [get_machine_number 
+                          for line in page_lines if valid_server_string(line)]    
+        start = min(server_numbers)
+        end = max(server_numbers)
+    
+    in_range = lambda n:  n >= start and n <= end
+    
+    rows = [(get_name(line), get_load(line))
+            for line in page_lines if (valid_server_string(line) and
+                                       (get_machine_number(line) not in exclude_numbers) and # not in exclude numbers
+                                       not reserved(line) and # not reversed by others
+                                       not in_range(get_machine_number(line)) # not in the "due date" range
+                                   )]
+    return sorted(rows, key = itemgetter(1))[:n]
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+
+def can_connect_without_password(name):
+    try:
+        ssh.connect("{}.hpc.cs.helsinki.fi".format(name))
+        return True
+    except (paramiko.BadHostKeyException,
+            paramiko.AuthenticationException,
+            paramiko.SSHException,
+            socket.error) as e:
+        print(e)
+        return False
+        
+        
+
+if __name__ == "__main__":
+    import sys, argparse, operator
+    parser = argparse.ArgumentParser(description = "List the best ukko servers sorted by CPU load")
+    parser.add_argument('-n', type=int, required = True,
+                        dest = "machine_number",
+                        help = "How many machine to list"
+    )
+
+    parser.add_argument('--exclude-range', type=int, required = False, nargs="+",
+                        default = None,
+                        dest = "exclude_range",
+                        help = "The range of machine ids to exclude"
+    )
+    
+    parser.add_argument('--exclude-numbers', type=int, required = False, nargs="+",
+                        dest = "exclude_numbers",
+                        help = "The machine ids to exclude"
+    )
+
+    parser.add_argument('-d', type=str, required = False, 
+                        dest = "delimiter",
+                        default='\n',
+                        help = "Delimiter to separate the machine id strings"
+    )
+    
+    args = parser.parse_args()
+    
+    servers_with_loads = best_n(args.machine_number, 
+                                exclude_number_range = args.exclude_range,
+                                exclude_numbers = args.exclude_numbers
+                            )
+    sys.stderr.write("Servers with load:\n")
+    sys.stderr.write("\n".join(
+        map(lambda stuff: repr(stuff), 
+            servers_with_loads))
+    )
+    
+    sys.stderr.write('\n')
+
+    servers = filter(
+        can_connect_without_password,
+        map(operator.itemgetter(0),
+            servers_with_loads)
+    )
+    
+    print args.delimiter.join(servers)
